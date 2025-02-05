@@ -5,7 +5,6 @@ import warnings
 import weakref
 import random
 import string
-import hashlib
 from collections import defaultdict
 from typing import (
     Any,
@@ -17,19 +16,14 @@ from typing import (
     List,
     Optional,
     Tuple,
-    Union,
 )
 from typing import *  # noqa: F403
 import enum
 from weakref import ReferenceType
 
 import torch
-import torch.fx.traceback as fx_traceback
-from torch._functorch._aot_autograd.functional_utils import is_fun
 from torch.utils._pytree import tree_map
 from torch.testing._internal.logging_tensor import capture_logs, LoggingTensorMode
-from torch.utils._python_dispatch import TorchDispatchMode
-from stream_manager import StreamManager
 
 __all__ = [
     "checkpoint",
@@ -54,6 +48,14 @@ _DEFAULT_DETERMINISM_MODE = "default"
 
 _checkpoint_debug_enabled: Optional[bool] = None
 
+class StreamManager:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.stream = torch.cuda.Stream()
+        return cls._instance
 
 @contextlib.contextmanager
 def set_checkpoint_debug_enabled(enabled: Optional[bool]):
