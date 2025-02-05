@@ -1,8 +1,11 @@
 import contextlib
+import platform
 import uuid
-import random, string
 import warnings
 import weakref
+import random
+import string
+import hashlib
 from collections import defaultdict
 from typing import (
     Any,
@@ -14,14 +17,19 @@ from typing import (
     List,
     Optional,
     Tuple,
+    Union,
 )
+from typing import *  # noqa: F403
+import enum
 from weakref import ReferenceType
-from torch.testing._internal.logging_tensor import LoggingTensorMode, capture_logs
-import platform
-#from utils import print
+
 import torch
-#from utils import MemoryMonitor
-from .stream_manager import StreamManager
+import torch.fx.traceback as fx_traceback
+from torch._functorch._aot_autograd.functional_utils import is_fun
+from torch.utils._pytree import tree_map
+from torch.testing._internal.logging_tensor import capture_logs, LoggingTensorMode
+from torch.utils._python_dispatch import TorchDispatchMode
+from stream_manager import StreamManager
 
 __all__ = [
     "checkpoint",
@@ -35,9 +43,38 @@ __all__ = [
     "noop_context_fn",
     "set_checkpoint_early_stop",
     "DefaultDeviceType",
+    "set_checkpoint_debug_enabled",
+    "CheckpointPolicy",
+    "SelectiveCheckpointContext",
+    "create_selective_checkpoint_contexts",
+    "SAC_IGNORED_OPS",
 ]
 
 _DEFAULT_DETERMINISM_MODE = "default"
+
+_checkpoint_debug_enabled: Optional[bool] = None
+
+
+@contextlib.contextmanager
+def set_checkpoint_debug_enabled(enabled: Optional[bool]):
+    """
+    Context manager that sets whether checkpoint should print additional debug
+    information when running. See the ``debug`` flag for
+    :func:`~torch.utils.checkpoint.checkpoint` for more information. Note that
+    when set, this context manager overrides the value of ``debug`` passed to
+    checkpoint. To defer to the local setting, pass ``None`` to this context.
+
+    Args:
+        enabled (bool): Whether checkpoint should print debug information.
+            Default is 'None'.
+    """
+    global _checkpoint_debug_enabled
+    try:
+        prev = _checkpoint_debug_enabled
+        _checkpoint_debug_enabled = enabled
+        yield
+    finally:
+        _checkpoint_debug_enabled = prev
 
 
 def detach_variable(inputs: Tuple[Any, ...]) -> Tuple[torch.Tensor, ...]:
@@ -67,6 +104,8 @@ def check_backward_validity(inputs: Iterable[Any]) -> None:
 
 
 def _get_device_module(device="cuda"):
+    if device == "meta":
+        return torch.device("meta")
     device_module = getattr(torch, device)
     return device_module
 
@@ -74,11 +113,13 @@ def _get_device_module(device="cuda"):
 class DefaultDeviceType:
     r"""
     A class that manages the default device type for checkpointing.
+
     If no non-CPU tensors are present, the default device type will
     be used. The default value is 'cuda'. The device type is used in
     the checkpointing process when determining which device states
     to save and restore for recomputation.
     """
+
     _default_device_type = "cuda"
 
     @staticmethod
@@ -103,24 +144,27 @@ class DefaultDeviceType:
 
 
 def _infer_device_type(*args):
-    device_types = list(
-        {
-            arg.device.type
-            for arg in args
-            if isinstance(arg, torch.Tensor) and not arg.device.type == "cpu"
-        }
-    )
-    if len(device_types) > 1:
+    device_types = []
+
+    def add_device_types(arg):
+        nonlocal device_types
+        if isinstance(arg, torch.Tensor) and arg.device.type not in {"cpu", "meta"}:
+            device_types.append(arg.device.type)
+    tree_map(add_device_types, args)
+
+    device_types_set = set(device_types)
+    if len(device_types_set) > 1:
         warnings.warn(
             "Tensor arguments, excluding CPU tensors, are detected on at least two types of devices. "
             "Device state will only be saved for devices of a single device type, and the remaining "
             "devices will be ignored. Consequently, if any checkpointed functions involve randomness, "
             "this may result in incorrect gradients. (Note that if CUDA devices are among the devices "
             "detected, it will be prioritized; otherwise, the first device encountered will be selected.)"
+            f"\nDevice types: {sorted(device_types_set)} first device type: {device_types[0]}"
         )
     if len(device_types) == 0:
         return DefaultDeviceType.get_device_type()
-    elif "cuda" in device_types:
+    elif "cuda" in device_types_set:
         return "cuda"
     else:
         return device_types[0]
@@ -136,17 +180,16 @@ def _infer_device_type(*args):
 def get_device_states(*args) -> Tuple[List[int], List[torch.Tensor]]:
     # This will not error out if "arg" is a CPU tensor or a non-tensor type because
     # the conditionals short-circuit.
-    fwd_device_ids = list(
-        {
-            arg.get_device()
-            for arg in args
-            if isinstance(arg, torch.Tensor) and not arg.device.type == "cpu"
-        }
-    )
+    fwd_device_ids = []
+
+    def add_device_ids(arg):
+        nonlocal fwd_device_ids
+        if isinstance(arg, torch.Tensor) and arg.device.type not in {"cpu", "meta"}:
+            fwd_device_ids.append(arg.get_device())
+    tree_map(add_device_ids, args)
 
     fwd_device_states = []
     device_module = _get_device_module(_infer_device_type(*args))
-
     for device_id in fwd_device_ids:
         with device_module.device(device_id):
             fwd_device_states.append(device_module.get_rng_state())
@@ -154,42 +197,44 @@ def get_device_states(*args) -> Tuple[List[int], List[torch.Tensor]]:
     return fwd_device_ids, fwd_device_states
 
 
-def set_device_states(devices, states) -> None:
-    device_module = _get_device_module(_infer_device_type(*states))
+def set_device_states(devices, states, *, device_type=None) -> None:
+    """Sets random number generator states for the specified devices.
+
+    Args:
+        devices: Device ids to set states for.
+        states: States to set.
+        device_type: ``device_type`` of the devices to set states for. Default
+            is the device returned by a call to ``DefaultDeviceType.get_device_type()``,
+            which is ``cuda`` if not changed by calling ``DefaultDeviceType::set_device_type()``.
+    """
+    if device_type is None:
+        device_type = DefaultDeviceType.get_device_type()
+    if device_type == "meta":
+        return
+    device_module = _get_device_module(device_type)
     for device, state in zip(devices, states):
         with device_module.device(device):
             device_module.set_rng_state(state)
 
 
-def _get_autocast_kwargs(device="cuda"):
-    if device == "cuda":
+def _get_autocast_kwargs(device_type="cuda"):
+    if torch.amp.is_autocast_available(device_type):
         device_autocast_kwargs = {
-            "enabled": torch.is_autocast_enabled(),
-            "dtype": torch.get_autocast_gpu_dtype(),
-            "cache_enabled": torch.is_autocast_cache_enabled(),
-        }
-    elif _supports_autocast(device):
-        device_module = _get_device_module(device)
-        device_autocast_kwargs = {
-            "enabled": device_module.is_autocast_enabled(),
-            "dtype": device_module.get_autocast_dtype(),
+            "enabled": torch.is_autocast_enabled(device_type),
+            "dtype": torch.get_autocast_dtype(device_type),
             "cache_enabled": torch.is_autocast_cache_enabled(),
         }
     else:
         device_autocast_kwargs = None
 
     cpu_autocast_kwargs = {
-        "enabled": torch.is_autocast_cpu_enabled(),
-        "dtype": torch.get_autocast_cpu_dtype(),
+        "enabled": torch.is_autocast_enabled('cpu'),
+        "dtype": torch.get_autocast_dtype('cpu'),
         "cache_enabled": torch.is_autocast_cache_enabled(),
     }
 
     return device_autocast_kwargs, cpu_autocast_kwargs
 
-def _supports_autocast(device):
-    device_module = _get_device_module(device)
-    return device == "cuda" or (hasattr(device_module, "is_autocast_enabled")
-                                and hasattr(device_module, "get_autocast_dtype"))
 
 class CheckpointFunction(torch.autograd.Function):
     @staticmethod
@@ -198,9 +243,9 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
-        ctx.device = _infer_device_type(*args)
+        ctx.device_type = _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
-            ctx.device
+            ctx.device_type
         )
         if preserve_rng_state:
             ctx.fwd_cpu_state = torch.get_rng_state()
@@ -209,7 +254,7 @@ class CheckpointFunction(torch.autograd.Function):
             # run_function, we SHOULD actually stash the cuda state here.  Unfortunately,
             # we have no way to anticipate this will happen before we run the function.)
             ctx.had_device_in_fwd = False
-            device_module = _get_device_module(ctx.device)
+            device_module = _get_device_module(ctx.device_type)
             if getattr(device_module, "_initialized", False):
                 ctx.had_device_in_fwd = True
                 ctx.fwd_devices, ctx.fwd_device_states = get_device_states(*args)
@@ -237,15 +282,15 @@ class CheckpointFunction(torch.autograd.Function):
     def backward(ctx, *args):
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
-                "Checkpointing is not compatible with .grad() or when an `inputs` parameter"
-                " is passed to .backward(). Please use .backward() and do not pass its `inputs`"
-                " argument."
+                "When use_reentrant=True, torch.utils.checkpoint is incompatible"
+                " with .grad() or passing an `inputs` parameter to .backward()."
+                " To resolve this error, you can either set use_reentrant=False,"
+                " or call .backward() without passing the `inputs` argument."
             )
         # Copy the list to avoid modifying original list.
         inputs = list(ctx.inputs)
         tensor_indices = ctx.tensor_indices
         tensors = ctx.saved_tensors
-        device_module = _get_device_module(ctx.device)
 
         # Fill in inputs with appropriate saved tensors.
         for i, idx in enumerate(tensor_indices):
@@ -258,19 +303,18 @@ class CheckpointFunction(torch.autograd.Function):
         if ctx.preserve_rng_state and ctx.had_device_in_fwd:
             rng_devices = ctx.fwd_devices
         with torch.random.fork_rng(
-            devices=rng_devices, enabled=ctx.preserve_rng_state, device_type=ctx.device
+            devices=rng_devices, enabled=ctx.preserve_rng_state, device_type=ctx.device_type
         ):
             if ctx.preserve_rng_state:
                 torch.set_rng_state(ctx.fwd_cpu_state)
                 if ctx.had_device_in_fwd:
-                    set_device_states(ctx.fwd_devices, ctx.fwd_device_states)
+                    set_device_states(ctx.fwd_devices, ctx.fwd_device_states, device_type=ctx.device_type)
             detached_inputs = detach_variable(tuple(inputs))
 
-            device_autocast_ctx = device_module.amp.autocast(
-                **ctx.device_autocast_kwargs
-            ) if _supports_autocast(ctx.device) else contextlib.nullcontext()
-            with torch.enable_grad(), device_autocast_ctx, \
-                 torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):
+            device_autocast_ctx = torch.amp.autocast(
+                device_type=ctx.device_type, **ctx.device_autocast_kwargs
+            ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
+            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -296,7 +340,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         return (None, None) + grads
 
-Gmatepoint_stream = None
+#Gmatepoint_stream = None
 Gmatepoint_ctx = []
 
 def noop_context_fn():
@@ -324,7 +368,7 @@ def checkpoint(
     debug: bool = False,
     **kwargs
 ):
-    r"""Checkpoint a model or part of the model
+    r"""Checkpoint a model or part of the model.
 
     Activation checkpointing is a technique that trades compute for memory.
     Instead of keeping tensors needed for backward alive until they are used in
@@ -347,9 +391,10 @@ def checkpoint(
 
     .. warning::
 
-        If you are using the ``use_reentrant=True`` variant (this is currently
-        the default), please refer to the note below for important
-        considerations and potential limitations.
+        The ``use_reentrant`` parameter should be passed explicitly. In version
+        2.5 we will raise an exception if ``use_reentrant`` is not passed. If you
+        are using the ``use_reentrant=True`` variant, please refer to the note below
+        for important considerations and potential limitations.
 
     .. note::
 
@@ -408,8 +453,7 @@ def checkpoint(
             implementation that does not require re-entrant autograd. This
             allows ``checkpoint`` to support additional functionality, such as
             working as expected with ``torch.autograd.grad`` and support for
-            keyword arguments input into the checkpointed function. Note that future
-            versions of PyTorch will default to ``use_reentrant=False``.
+            keyword arguments input into the checkpointed function.
             Default: ``True``
         context_fn(Callable, optional): A callable returning a tuple of two
             context managers. The function and its recomputation will be run
@@ -432,12 +476,11 @@ def checkpoint(
     Returns:
         Output of running :attr:`function` on :attr:`*args`
     """
-    
     # if stream is None:
     #     stream = Gmatepoint_stream
+    stream = StreamManager().stream
     if matepoint_ctx is None:
         matepoint_ctx = Gmatepoint_ctx
-    stream = StreamManager().stream
     assert stream is not None, "Matepoint sucks without it's own stream"
     if use_reentrant is None:
         warnings.warn(
@@ -446,9 +489,11 @@ def checkpoint(
             "will be updated to be False in the future. To maintain current "
             "behavior, pass use_reentrant=True. It is recommended that you use "
             "use_reentrant=False. Refer to docs for more details on the "
-            "differences between the two variants."
+            "differences between the two variants.",
+            stacklevel=2
         )
         use_reentrant = True
+
     # Hack to mix *args with **kwargs in a python 2.7-compliant way
     preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs and use_reentrant:
@@ -477,8 +522,7 @@ def checkpoint(
             return ret
 
 
-
-def checkpoint_sequential(functions, segments, input, use_reentrant=True, **kwargs):
+def checkpoint_sequential(functions, segments, input, use_reentrant=None, **kwargs):
     r"""A helper function for checkpointing sequential models.
 
     Sequential models execute a list of modules/functions in order
@@ -488,12 +532,14 @@ def checkpoint_sequential(functions, segments, input, use_reentrant=True, **kwar
     be saved for re-running the segment in the backward pass.
 
     .. warning::
-        If you are using the ``use_reentrant=True` variant (this is the
-        default), please see :func:`~torch.utils.checkpoint.checkpoint` for
+        The ``use_reentrant`` parameter should be passed explicitly. In version
+        2.5 we will raise an exception if ``use_reentrant`` is not passed. If you
+        are using the ``use_reentrant=True` variant, please see
+        :func:`~torch.utils.checkpoint.checkpoint` for
         the important considerations and limitations of this variant. It is
         recommended that you use ``use_reentrant=False``.
 
-    .. warning:
+    .. warning::
         Since PyTorch 1.4, it allows only one Tensor as the input and
         intermediate outputs, just like :class:`torch.nn.Sequential`.
 
@@ -522,6 +568,18 @@ def checkpoint_sequential(functions, segments, input, use_reentrant=True, **kwar
         >>> model = nn.Sequential(...)
         >>> input_var = checkpoint_sequential(model, chunks, input_var)
     """
+    if use_reentrant is None:
+        warnings.warn(
+            "torch.utils.checkpoint.checkpoint_sequential: the use_reentrant "
+            "parameter should be passed explicitly. "
+            "In version 2.5 we will raise an exception if use_reentrant "
+            "is not passed. use_reentrant=False is "
+            "recommended, but if you need to preserve the current default "
+            "behavior, you can pass use_reentrant=True. Refer to docs for more "
+            "details on the differences between the two variants."
+        )
+        use_reentrant = True
+
     # Hack for keyword-only parameter in a python 2.7-compliant way
     preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs:
@@ -552,7 +610,6 @@ def checkpoint_sequential(functions, segments, input, use_reentrant=True, **kwar
             preserve_rng_state=preserve,
         )
     return run_function(end + 1, len(functions) - 1, functions)(input)
-
 
 
 def _internal_assert(cond):
@@ -691,7 +748,7 @@ def _internal_assert(cond):
 # 4. Don't save x since we are inside a checkpoint.
 # 5. Calling backward triggers another recompute of fn. During recompute, we see
 #    that x and y have already been cleared in the original graph as indicated
-#    by holder=None. We skip over them. We still save x at (4) (since its holder
+#    by holder=None. We skip over them. We still save x at (4) (since its holder,
 #    is still alive.)
 
 _enable_checkpoint_early_stop = True
@@ -993,6 +1050,7 @@ def _get_debug_context_and_cb() -> Tuple[Callable[[], Any], Callable[[Checkpoint
 
     return context_fn, unpack_error_cb
 
+
 def _default_meta_extractor(x: torch.Tensor) -> Dict[str, Any]:
     # These properties are fast to check, easy to understand
     return {
@@ -1014,6 +1072,7 @@ class _StopRecomputationError(Exception):
 class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):
     def __init__(self, target_frame_ref: ReferenceType, gid: int):
         def pack_hook(x):
+            x = x.detach() if x.requires_grad else x
             target_frame = target_frame_ref()
             assert target_frame is not None  # appease mypy
             recomp_idx = target_frame.recomp_counter[gid]
@@ -1028,7 +1087,7 @@ class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):
                     # we check if the number of tensors saved during forward and
                     # recomputation match.
                     target_frame.ignore_saved_mismatch = True
-                    return x.detach()
+                    return x
                 raise CheckpointError(
                     "torch.utils.checkpoint: trying to save more tensors during "
                     "recomputation than during the original forward pass."
@@ -1041,14 +1100,14 @@ class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):
             if holder is not None:
                 _internal_assert(holder.handles.get(gid, None) is None)
                 holder.handles[gid] = _Handle()
-                target_frame.recomputed[gid][holder.handles[gid]] = x.detach()
+                target_frame.recomputed[gid][holder.handles[gid]] = x
 
             if target_frame.early_stop and target_frame.recomp_counter[gid] == len(
                 target_frame.weak_holders
             ):
                 raise _StopRecomputationError()
             # See Rule 6: [ retain_graph is True ] above
-            return x.detach()
+            return x
 
         def unpack_hook(x):
             # See Rule 6: [ retain_graph is True ] above for an example of when
@@ -1056,6 +1115,7 @@ class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):
             return x
 
         super().__init__(pack_hook, unpack_hook)
+
 
 class _checkpoint_hook(torch.autograd.graph.saved_tensors_hooks):
     def __init__(self, frame):
@@ -1117,34 +1177,35 @@ class _checkpoint_hook(torch.autograd.graph.saved_tensors_hooks):
 #     saving/restoring of global state is handled here.
 
 PRINT = False
-#PRINT = int(os.environ.get('RANK', 0)) == 0
+# PRINT = int(os.environ.get('RANK', 0)) == 0
 
 def size_mb(t):
-    return t.numel() * t.element_size() / 1024 / 1024 
+    return t.numel() * t.element_size() / 1024 / 1024
 
 # This function is called when we are sending tensors back to the GPU in the backwards pass
-def matepoint_pipeline(ctx,stream):
-    if len(ctx) >= 1: 
+def matepoint_pipeline(ctx, stream):
+    if len(ctx) >= 1:
         with torch.cuda.stream(stream):
-            if 1: 
+            if 1:
                 ctx_extra = []
                 check = ctx[-1][-1]
                 for x, d, _ in zip(*ctx[-1]):
                     if hasattr(x, "device"):
-                        if PRINT: print(f"[=>] moving (p) {[xx for xx in x.shape]} {size_mb(x):.2f} MiB from {x.device} to {d} | check: {check}")
+                        if PRINT:
+                            print(f"[=>] moving (p) {[xx for xx in x.shape]} {size_mb(x):.2f} MiB from {x.device} to {d} | check: {check}")
                         ctx_extra.append(x.to(d, non_blocking=True))
                     else:
                         ctx_extra.append(x)
                 ctx[-1][0] = ctx_extra
-            else: # keeping the old list comprehension for reference
+            else:
                 ctx[-1][0] = [x.to(d, non_blocking=True) if hasattr(x, "device") else x for x, d, _ in zip(*ctx[-1])]
 
 import hashlib
 def elist(xx):
-    #return
+    # return
     out = []
     for x in xx:
-        #out.append(hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:4])
+        # out.append(hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:4])
         out.append(x.flatten()[0].item())
     return out
 
@@ -1157,7 +1218,7 @@ NOPIPELINE = False
 def _checkpoint_without_reentrant_generator(
     fn,
     stream,
-    matepoint_ctx = None,
+    matepoint_ctx=None,
     preserve_rng_state=True,
     context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
     determinism_check: str = _DEFAULT_DETERMINISM_MODE,
@@ -1166,6 +1227,7 @@ def _checkpoint_without_reentrant_generator(
     **kwargs
 ):
     """Checkpointing without reentrant autograd
+
     Args:
         function: describes what to run in the forward pass of the model or
             part of the model. It should also know how to handle the inputs
@@ -1191,12 +1253,11 @@ def _checkpoint_without_reentrant_generator(
         *args: Arguments to pass in to the given ``function``.
         **kwargs: Keyword arguments to pass into the given ``function``.
     """
-
     global bigN, bigTable
 
-    #global all_contexts
+    # global all_contexts
 
-    ogextra = ''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(8))
+    ogextra = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
 
     unpack_error_cb = None
 
@@ -1219,7 +1280,7 @@ def _checkpoint_without_reentrant_generator(
     device_module = _get_device_module(device)
     forward_context, recompute_context = context_fn()
     # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
-    device_autocast_kwargs, cpu_autocast_kwargs = _get_autocast_kwargs(device=device)
+    device_autocast_kwargs, cpu_autocast_kwargs = _get_autocast_kwargs(device_type=device)
 
     if preserve_rng_state:
         fwd_cpu_state = torch.get_rng_state()
@@ -1235,10 +1296,6 @@ def _checkpoint_without_reentrant_generator(
 
     def recompute_fn(*inputs):
         kwargs, *args = inputs
-        #devices = kwargs["devices"]
-        #del kwargs["devices"]
-        #print("matepoint recompute fn", kwargs, args)
-        #global all_contexts
         # This will be called later during recomputation. This wrapping enables
         # the necessary global state to be captured.
         rng_devices = []
@@ -1250,41 +1307,41 @@ def _checkpoint_without_reentrant_generator(
             if preserve_rng_state:
                 torch.set_rng_state(fwd_cpu_state)
                 if had_device_in_fwd:
-                    set_device_states(fwd_devices, fwd_device_states)
+                    set_device_states(fwd_devices, fwd_device_states, device_type=device)
 
-            device_autocast_ctx = device_module.amp.autocast(
-                **device_autocast_kwargs
-            ) if _supports_autocast(device) else contextlib.nullcontext()
-            with device_autocast_ctx, torch.cpu.amp.autocast(**cpu_autocast_kwargs), \
+            device_autocast_ctx = torch.amp.autocast(
+                device_type=device, **device_autocast_kwargs
+            ) if torch.amp.is_autocast_available(device) else contextlib.nullcontext()
+            with device_autocast_ctx, torch.amp.autocast(device_type="cpu",**cpu_autocast_kwargs), \
                  recompute_context:
-                
                 if NOPIPELINE:
                     idx = [i for i in range(len(matepoint_ctx)) if matepoint_ctx[i][2] == ogextra]
                     assert len(idx) == 1
                     idx = idx[0]
-                    #print("fetched", idx)
+                    # print("fetched", idx)
                     args, devices, checksum = matepoint_ctx.pop(idx)
                 else:
-                    args, devices, checksum = matepoint_ctx.pop()          
-                
-                # This is where tensors are moved back to the GPU for computation in the backwards pass.
-                # 
+                    args, devices, checksum = matepoint_ctx.pop()
 
-                if 1: 
+                # This is where tensors are moved back to the GPU for computation in the backwards pass.
+                #
+
+                if 1:
                     newargs = []
                     for arg, d in zip(args, devices):
-                        if callable(arg): # bigTable stuff, fix indexing
+                        if callable(arg):  # bigTable stuff, fix indexing
                             arg = arg()[None]
                         if d is not None:
                             if arg.device != d:
-                                if PRINT: print(f"[=>] moving     {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {d} | check: {checksum}, og: {ogextra}")
+                                if PRINT:
+                                    print(f"[=>] moving (p) {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {d} | check: {checksum}, og: {ogextra}")
                                 arg = arg.to(d)
                         newargs.append(arg)
                     args = newargs
 
-                else: # keeping the old list comprehension for reference
+                else:  # keeping the old list comprehension for reference
                     args = [(arg.to(d) if arg.device != d else arg) if d is not None else arg for arg, d in zip(args, devices)]
-                
+
                 assert checksum == ogextra, f"matepoint checksum mismatch: {checksum} vs {ogextra}"
                 if not NOPIPELINE:
                     with torch.cuda.stream(stream):
@@ -1292,10 +1349,9 @@ def _checkpoint_without_reentrant_generator(
                         if matepoint_ctx is not None:
 
                             # Most tensors should be moved in the pipelined move
-                            matepoint_pipeline(matepoint_ctx,stream)
+                            matepoint_pipeline(matepoint_ctx, stream)
 
                 fn(*[x for x, d in zip(args, devices)], **kwargs)
-
 
     new_frame = _CheckpointFrame(
         recompute_fn,
@@ -1305,9 +1361,8 @@ def _checkpoint_without_reentrant_generator(
     )
     dummy = torch.empty((0,), requires_grad=True)
     cpu = torch.device("cpu")
-    #kwargs["devices"] = [x.device if hasattr(x, "device") else None for x in args]
-    
-    args_cpu, devices = [],[]
+    # kwargs["devices"] = [x.device if hasattr(x, "device") else None for x in args]
+    args_cpu, devices = [], []
     with torch.cuda.stream(stream):
 
         for arg in args:
@@ -1318,9 +1373,9 @@ def _checkpoint_without_reentrant_generator(
             # This part is called during the forwards pass, and is when tensors are sent back to the CPU
 
             if device_ is not None:
-                if PRINT: 
+                if PRINT:
                     print(f"[<=] moving {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {cpu} | og: {ogextra}")
-                    #print(MemoryMonitor().str())
+                    # print(MemoryMonitor().str())
                 if bigTable is not None and arg[0].shape[-1] == bigTable[0].shape[-1]:
                     bigTable[bigN].copy_(arg[0], non_blocking=True)
                     def oops(capt):
@@ -1336,10 +1391,10 @@ def _checkpoint_without_reentrant_generator(
             args_cpu.append(xcpu)
 
     new_frame.input_saver = _NoopSaveInputs.apply(dummy, kwargs, len(matepoint_ctx))
-
     matepoint_ctx.append([args_cpu, devices, ogextra])
     del xcpu
     del args_cpu
+
     # When ambient grad_mode is False
     if new_frame.input_saver.grad_fn is None:
         yield
@@ -1350,7 +1405,7 @@ def _checkpoint_without_reentrant_generator(
     new_frame.forward_completed = True
 
     if getattr(device_module, "_initialized", False) and \
-       preserve_rng_state and not had_device_in_fwd:
+       preserve_rng_state and not had_device_in_fwd:  # type: ignore[possibly-undefined]
         # Device was not initialized before running the forward, so we didn't
         # stash the device state.
         raise RuntimeError(
