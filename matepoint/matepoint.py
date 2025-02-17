@@ -57,6 +57,17 @@ class StreamManager:
             cls._instance.stream = torch.cuda.Stream()
         return cls._instance
 
+class NestedMatepointContext:
+    _INSIDE_MATEPOINT = False
+    
+    def __enter__(self):
+        assert not NestedMatepointContext._INSIDE_MATEPOINT, "Nested matepoint calls are not supported"
+        NestedMatepointContext._INSIDE_MATEPOINT = True
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        NestedMatepointContext._INSIDE_MATEPOINT = False
+
 @contextlib.contextmanager
 def set_checkpoint_debug_enabled(enabled: Optional[bool]):
     """
@@ -478,50 +489,49 @@ def checkpoint(
     Returns:
         Output of running :attr:`function` on :attr:`*args`
     """
-    # if stream is None:
-    #     stream = Gmatepoint_stream
-    stream = StreamManager().stream
-    if matepoint_ctx is None:
-        matepoint_ctx = Gmatepoint_ctx
-    assert stream is not None, "Matepoint sucks without it's own stream"
-    if use_reentrant is None:
-        warnings.warn(
-            "torch.utils.checkpoint: please pass in use_reentrant=True or "
-            "use_reentrant=False explicitly. The default value of use_reentrant "
-            "will be updated to be False in the future. To maintain current "
-            "behavior, pass use_reentrant=True. It is recommended that you use "
-            "use_reentrant=False. Refer to docs for more details on the "
-            "differences between the two variants.",
-            stacklevel=2
-        )
-        use_reentrant = True
-
-    # Hack to mix *args with **kwargs in a python 2.7-compliant way
-    preserve = kwargs.pop("preserve_rng_state", True)
-    if kwargs and use_reentrant:
-        raise ValueError(
-            "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
-        )
-
-    if use_reentrant:
-        if context_fn is not noop_context_fn or debug is not False:
-            raise ValueError(
-                "Passing `context_fn` or `debug` is only supported when "
-                "use_reentrant=False."
+    with NestedMatepointContext():
+        stream = StreamManager().stream
+        if matepoint_ctx is None:
+            matepoint_ctx = Gmatepoint_ctx
+        assert stream is not None, "Matepoint sucks without it's own stream"
+        if use_reentrant is None:
+            warnings.warn(
+                "torch.utils.checkpoint: please pass in use_reentrant=True or "
+                "use_reentrant=False explicitly. The default value of use_reentrant "
+                "will be updated to be False in the future. To maintain current "
+                "behavior, pass use_reentrant=True. It is recommended that you use "
+                "use_reentrant=False. Refer to docs for more details on the "
+                "differences between the two variants.",
+                stacklevel=2
             )
-        return CheckpointFunction.apply(function, preserve, *args)
-    else:
-        gen = _checkpoint_without_reentrant_generator(
-            function, stream, matepoint_ctx, preserve, context_fn, determinism_check, debug, *args, **kwargs
-        )
-        # Runs pre-forward logic
-        next(gen)
-        ret = function(*args, **kwargs)
-        # Runs post-forward logic
-        try:
+            use_reentrant = True
+
+        # Hack to mix *args with **kwargs in a python 2.7-compliant way
+        preserve = kwargs.pop("preserve_rng_state", True)
+        if kwargs and use_reentrant:
+            raise ValueError(
+                "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
+            )
+
+        if use_reentrant:
+            if context_fn is not noop_context_fn or debug is not False:
+                raise ValueError(
+                    "Passing `context_fn` or `debug` is only supported when "
+                    "use_reentrant=False."
+                )
+            return CheckpointFunction.apply(function, preserve, *args)
+        else:
+            gen = _checkpoint_without_reentrant_generator(
+                function, stream, matepoint_ctx, preserve, context_fn, determinism_check, debug, *args, **kwargs
+            )
+            # Runs pre-forward logic
             next(gen)
-        except StopIteration:
-            return ret
+            ret = function(*args, **kwargs)
+            # Runs post-forward logic
+            try:
+                next(gen)
+            except StopIteration:
+                return ret
 
 
 def checkpoint_sequential(functions, segments, input, use_reentrant=None, **kwargs):
