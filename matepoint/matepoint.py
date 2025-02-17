@@ -58,8 +58,14 @@ class StreamManager:
         return cls._instance
 
 class NestedMatepointContext:
+    _instance = None
     _INSIDE_MATEPOINT = False
     
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(NestedMatepointContext, cls).__new__(cls)
+        return cls._instance
+
     def __enter__(self):
         assert not NestedMatepointContext._INSIDE_MATEPOINT, "Nested matepoint calls are not supported"
         NestedMatepointContext._INSIDE_MATEPOINT = True
@@ -496,15 +502,10 @@ def checkpoint(
         assert stream is not None, "Matepoint sucks without it's own stream"
         if use_reentrant is None:
             warnings.warn(
-                "torch.utils.checkpoint: please pass in use_reentrant=True or "
-                "use_reentrant=False explicitly. The default value of use_reentrant "
-                "will be updated to be False in the future. To maintain current "
-                "behavior, pass use_reentrant=True. It is recommended that you use "
-                "use_reentrant=False. Refer to docs for more details on the "
-                "differences between the two variants.",
+                "Defaulting to use_reentrant=False",
                 stacklevel=2
             )
-            use_reentrant = True
+            use_reentrant = False
 
         # Hack to mix *args with **kwargs in a python 2.7-compliant way
         preserve = kwargs.pop("preserve_rng_state", True)
