@@ -1228,6 +1228,17 @@ bigN = 0
 NOPIPELINE = True
 NOPIPELINE = False
 
+def check_inplace_modifications(tensor):
+    """Check if a tensor has been modified in-place by comparing its version counter."""
+    if hasattr(tensor, "_version"):
+        current_version = tensor._version
+        if current_version > 0:
+            raise RuntimeError(
+                f"One of the variables has been modified by an inplace operation: "
+                f"[{tensor.type()} {list(tensor.shape)}], which is at version {current_version}; "
+                f"expected version 0 instead. In-place modifications are not supported with matepoint."
+            )
+
 def _checkpoint_without_reentrant_generator(
     fn,
     stream,
@@ -1415,6 +1426,9 @@ def _checkpoint_without_reentrant_generator(
 
     with _checkpoint_hook(new_frame), forward_context:
         yield
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            check_inplace_modifications(arg)
     new_frame.forward_completed = True
 
     if getattr(device_module, "_initialized", False) and \
