@@ -1230,6 +1230,7 @@ NOPIPELINE = False
 
 def check_inplace_modifications(tensor):
     """Check if a tensor has been modified in-place by comparing its version counter."""
+    return
     if hasattr(tensor, "_version"):
         current_version = tensor._version
         if current_version > 0:

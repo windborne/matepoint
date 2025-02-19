@@ -23,6 +23,7 @@ def get_TestModel():
 
 class InPlaceModel(torch.nn.Module):
     def forward(self, x):
+        #x = x.clone()
         x[0] += x[1]
         output = torch.sin(x)        
         return output
