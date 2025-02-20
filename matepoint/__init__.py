@@ -8,6 +8,5 @@ from .matepoint import (
 __all__ = [
     'checkpoint',
     'checkpoint_sequential',
-    'Gmatepoint_stream',
     'Gmatepoint_ctx',
 ]
