@@ -1,7 +1,6 @@
 from .matepoint import (
     checkpoint,
     checkpoint_sequential,
-    Gmatepoint_stream,
     Gmatepoint_ctx,
 )
 
