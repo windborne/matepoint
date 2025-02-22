@@ -22,7 +22,7 @@ from matepoint import checkpoint
 
 def forward(self, x):
     # Use exactly like torch.utils.checkpoint
-    out = checkpoint(self.layer, x)
+    out = checkpoint(self.layer, x, use_reentrant=False)
     return out
 ```
 
@@ -35,9 +35,13 @@ def forward(self, x):
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/matepoint.git
-cd matepoint
-pip install -e .
+pip install --index-url https://test.pypi.org/simple/ matepoint
+```
+
+## Build
+```bash
+python setup.py sdist bdist_wheel
+twine upload --repository testpypi dist/*
 ```
 
 ## References

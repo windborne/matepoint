@@ -18,7 +18,6 @@ from typing import (
     Tuple,
 )
 from typing import *  # noqa: F403
-import enum
 from weakref import ReferenceType
 
 import torch
@@ -29,11 +28,8 @@ __all__ = [
     "checkpoint",
     "checkpoint_sequential",
     "CheckpointError",
-    "CheckpointFunction",
     "check_backward_validity",
     "detach_variable",
-    "get_device_states",
-    "set_device_states",
     "noop_context_fn",
     "set_checkpoint_early_stop",
     "DefaultDeviceType",
@@ -122,13 +118,6 @@ def check_backward_validity(inputs: Iterable[Any]) -> None:
         )
 
 
-def _get_device_module(device="cuda"):
-    if device == "meta":
-        return torch.device("meta")
-    device_module = getattr(torch, device)
-    return device_module
-
-
 class DefaultDeviceType:
     r"""
     A class that manages the default device type for checkpointing.
@@ -189,53 +178,6 @@ def _infer_device_type(*args):
         return device_types[0]
 
 
-# We can't know if the run_fn will internally move some args to different devices,
-# which would require logic to preserve rng states for those devices as well.
-# We could paranoically stash and restore ALL the rng states for all visible devices,
-# but that seems very wasteful for most cases.  Compromise:  Stash the RNG state for
-# the device of all Tensor args.
-#
-# To consider:  maybe get_device_states and set_device_states should reside in torch/random.py?
-def get_device_states(*args) -> Tuple[List[int], List[torch.Tensor]]:
-    # This will not error out if "arg" is a CPU tensor or a non-tensor type because
-    # the conditionals short-circuit.
-    fwd_device_ids = []
-
-    def add_device_ids(arg):
-        nonlocal fwd_device_ids
-        if isinstance(arg, torch.Tensor) and arg.device.type not in {"cpu", "meta"}:
-            fwd_device_ids.append(arg.get_device())
-    tree_map(add_device_ids, args)
-
-    fwd_device_states = []
-    device_module = _get_device_module(_infer_device_type(*args))
-    for device_id in fwd_device_ids:
-        with device_module.device(device_id):
-            fwd_device_states.append(device_module.get_rng_state())
-
-    return fwd_device_ids, fwd_device_states
-
-
-def set_device_states(devices, states, *, device_type=None) -> None:
-    """Sets random number generator states for the specified devices.
-
-    Args:
-        devices: Device ids to set states for.
-        states: States to set.
-        device_type: ``device_type`` of the devices to set states for. Default
-            is the device returned by a call to ``DefaultDeviceType.get_device_type()``,
-            which is ``cuda`` if not changed by calling ``DefaultDeviceType::set_device_type()``.
-    """
-    if device_type is None:
-        device_type = DefaultDeviceType.get_device_type()
-    if device_type == "meta":
-        return
-    device_module = _get_device_module(device_type)
-    for device, state in zip(devices, states):
-        with device_module.device(device):
-            device_module.set_rng_state(state)
-
-
 def _get_autocast_kwargs(device_type="cuda"):
     if torch.amp.is_autocast_available(device_type):
         device_autocast_kwargs = {
@@ -254,110 +196,6 @@ def _get_autocast_kwargs(device_type="cuda"):
 
     return device_autocast_kwargs, cpu_autocast_kwargs
 
-
-class CheckpointFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, run_function, preserve_rng_state, *args):
-        check_backward_validity(args)
-        ctx.run_function = run_function
-        ctx.preserve_rng_state = preserve_rng_state
-        # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
-        ctx.device_type = _infer_device_type(*args)
-        ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
-            ctx.device_type
-        )
-        if preserve_rng_state:
-            ctx.fwd_cpu_state = torch.get_rng_state()
-            # Don't eagerly initialize the cuda context by accident.
-            # (If the user intends that the context is initialized later, within their
-            # run_function, we SHOULD actually stash the cuda state here.  Unfortunately,
-            # we have no way to anticipate this will happen before we run the function.)
-            ctx.had_device_in_fwd = False
-            device_module = _get_device_module(ctx.device_type)
-            if getattr(device_module, "_initialized", False):
-                ctx.had_device_in_fwd = True
-                ctx.fwd_devices, ctx.fwd_device_states = get_device_states(*args)
-
-        # Save non-tensor inputs in ctx, keep a placeholder None for tensors
-        # to be filled out during the backward.
-        ctx.inputs = []
-        ctx.tensor_indices = []
-        tensor_inputs = []
-        for i, arg in enumerate(args):
-            if torch.is_tensor(arg):
-                tensor_inputs.append(arg)
-                ctx.tensor_indices.append(i)
-                ctx.inputs.append(None)
-            else:
-                ctx.inputs.append(arg)
-
-        ctx.save_for_backward(*tensor_inputs)
-
-        with torch.no_grad():
-            outputs = run_function(*args)
-        return outputs
-
-    @staticmethod
-    def backward(ctx, *args):
-        if not torch.autograd._is_checkpoint_valid():
-            raise RuntimeError(
-                "When use_reentrant=True, torch.utils.checkpoint is incompatible"
-                " with .grad() or passing an `inputs` parameter to .backward()."
-                " To resolve this error, you can either set use_reentrant=False,"
-                " or call .backward() without passing the `inputs` argument."
-            )
-        # Copy the list to avoid modifying original list.
-        inputs = list(ctx.inputs)
-        tensor_indices = ctx.tensor_indices
-        tensors = ctx.saved_tensors
-
-        # Fill in inputs with appropriate saved tensors.
-        for i, idx in enumerate(tensor_indices):
-            inputs[idx] = tensors[i]
-
-        # Stash the surrounding rng state, and mimic the state that was
-        # present at this time during forward.  Restore the surrounding state
-        # when we're done.
-        rng_devices = []
-        if ctx.preserve_rng_state and ctx.had_device_in_fwd:
-            rng_devices = ctx.fwd_devices
-        with torch.random.fork_rng(
-            devices=rng_devices, enabled=ctx.preserve_rng_state, device_type=ctx.device_type
-        ):
-            if ctx.preserve_rng_state:
-                torch.set_rng_state(ctx.fwd_cpu_state)
-                if ctx.had_device_in_fwd:
-                    set_device_states(ctx.fwd_devices, ctx.fwd_device_states, device_type=ctx.device_type)
-            detached_inputs = detach_variable(tuple(inputs))
-
-            device_autocast_ctx = torch.amp.autocast(
-                device_type=ctx.device_type, **ctx.device_autocast_kwargs
-            ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
-                outputs = ctx.run_function(*detached_inputs)
-
-        if isinstance(outputs, torch.Tensor):
-            outputs = (outputs,)
-
-        # run backward() with only tensor that requires grad
-        outputs_with_grad = []
-        args_with_grad = []
-        for i in range(len(outputs)):
-            if torch.is_tensor(outputs[i]) and outputs[i].requires_grad:
-                outputs_with_grad.append(outputs[i])
-                args_with_grad.append(args[i])
-        if len(outputs_with_grad) == 0:
-            raise RuntimeError(
-                "none of output has requires_grad=True,"
-                " this checkpoint() is not necessary"
-            )
-        torch.autograd.backward(outputs_with_grad, args_with_grad)
-        grads = tuple(
-            inp.grad if isinstance(inp, torch.Tensor) else None
-            for inp in detached_inputs
-        )
-
-        return (None, None) + grads
 
 #Gmatepoint_stream = None
 Gmatepoint_ctx = []
@@ -381,7 +219,7 @@ def checkpoint(
     *args,
     stream = None,
     matepoint_ctx = None,
-    use_reentrant: Optional[bool] = None,
+    use_reentrant: Optional[bool] = False,
     context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
     determinism_check: str = _DEFAULT_DETERMINISM_MODE,
     debug: bool = False,
@@ -496,43 +334,39 @@ def checkpoint(
         Output of running :attr:`function` on :attr:`*args`
     """
     with NestedMatepointContext():
-        stream = StreamManager().stream
+        stream = StreamManager().stream # Matepoint sucks without it's own stream
         if matepoint_ctx is None:
             matepoint_ctx = Gmatepoint_ctx
-        assert stream is not None, "Matepoint sucks without it's own stream"
-        if use_reentrant is None:
+        if use_reentrant is None or use_reentrant is True:
             warnings.warn(
-                "Defaulting to use_reentrant=False",
+                "Overriding to set use_reentrant=False as no recomputation happens in matepoint",
                 stacklevel=2
             )
-            use_reentrant = False
 
         # Hack to mix *args with **kwargs in a python 2.7-compliant way
         preserve = kwargs.pop("preserve_rng_state", True)
-        if kwargs and use_reentrant:
+        if preserve:
+            warnings.warn(
+                "Overriding to set preserve_rng_state=False as no recomputation happens in matepoint",
+                stacklevel=2
+            )
+        check_inplace_modifications_flag = kwargs.pop("check_inplace_modifications", False)
+        if kwargs:
             raise ValueError(
                 "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
             )
 
-        if use_reentrant:
-            if context_fn is not noop_context_fn or debug is not False:
-                raise ValueError(
-                    "Passing `context_fn` or `debug` is only supported when "
-                    "use_reentrant=False."
-                )
-            return CheckpointFunction.apply(function, preserve, *args)
-        else:
-            gen = _checkpoint_without_reentrant_generator(
-                function, stream, matepoint_ctx, preserve, context_fn, determinism_check, debug, *args, **kwargs
-            )
-            # Runs pre-forward logic
+        gen = _checkpoint_without_reentrant_generator(
+            function, stream, matepoint_ctx, context_fn, determinism_check, debug, *args, check_inplace_modifications_flag=check_inplace_modifications_flag, **kwargs
+        )
+        # Runs pre-forward logic
+        next(gen)
+        ret = function(*args, **kwargs)
+        # Runs post-forward logic
+        try:
             next(gen)
-            ret = function(*args, **kwargs)
-            # Runs post-forward logic
-            try:
-                next(gen)
-            except StopIteration:
-                return ret
+        except StopIteration:
+            return ret
 
 
 def checkpoint_sequential(functions, segments, input, use_reentrant=None, **kwargs):
@@ -581,18 +415,6 @@ def checkpoint_sequential(functions, segments, input, use_reentrant=None, **kwar
         >>> model = nn.Sequential(...)
         >>> input_var = checkpoint_sequential(model, chunks, input_var)
     """
-    if use_reentrant is None:
-        warnings.warn(
-            "torch.utils.checkpoint.checkpoint_sequential: the use_reentrant "
-            "parameter should be passed explicitly. "
-            "In version 2.5 we will raise an exception if use_reentrant "
-            "is not passed. use_reentrant=False is "
-            "recommended, but if you need to preserve the current default "
-            "behavior, you can pass use_reentrant=True. Refer to docs for more "
-            "details on the differences between the two variants."
-        )
-        use_reentrant = True
-
     # Hack for keyword-only parameter in a python 2.7-compliant way
     preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs:
@@ -1230,7 +1052,6 @@ NOPIPELINE = False
 
 def check_inplace_modifications(tensor):
     """Check if a tensor has been modified in-place by comparing its version counter."""
-    return
     if hasattr(tensor, "_version"):
         current_version = tensor._version
         if current_version > 0:
@@ -1244,10 +1065,10 @@ def _checkpoint_without_reentrant_generator(
     fn,
     stream,
     matepoint_ctx=None,
-    preserve_rng_state=True,
     context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
     determinism_check: str = _DEFAULT_DETERMINISM_MODE,
     debug: bool = False,
+    check_inplace_modifications_flag: bool = False,
     *args,
     **kwargs
 ):
@@ -1259,9 +1080,6 @@ def _checkpoint_without_reentrant_generator(
             passed as the tuple. For example, in LSTM, if user passes
             ``(activation, hidden)``, :attr:`function` should correctly use the
             first input as ``activation`` and the second input as ``hidden``
-        preserve_rng_state(bool, optional):  Omit stashing and restoring
-            the RNG state during each checkpoint.
-            Default: ``True``
         context_fn(Callable, optional): A callable returning a tuple of two
             context managers. The function and its recomputation will be run
             under the first and second context managers respectively.
@@ -1302,81 +1120,58 @@ def _checkpoint_without_reentrant_generator(
         )
 
     device = _infer_device_type(*args)
-    device_module = _get_device_module(device)
     forward_context, recompute_context = context_fn()
     # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
     device_autocast_kwargs, cpu_autocast_kwargs = _get_autocast_kwargs(device_type=device)
-
-    if preserve_rng_state:
-        fwd_cpu_state = torch.get_rng_state()
-        # Don't eagerly initialize the cuda context by accident.
-        # (If the user intends that the context is initialized later, within their
-        # run_function, we SHOULD actually stash the cuda state here.  Unfortunately,
-        # we have no way to anticipate this will happen before we run the function.
-        # If they do so, we raise an error.)
-        had_device_in_fwd = False
-        if getattr(device_module, "_initialized", False):
-            had_device_in_fwd = True
-            fwd_devices, fwd_device_states = get_device_states(*args)
 
     def recompute_fn(*inputs):
         kwargs, *args = inputs
         # This will be called later during recomputation. This wrapping enables
         # the necessary global state to be captured.
-        rng_devices = []
-        if preserve_rng_state and had_device_in_fwd:
-            rng_devices = fwd_devices
-        with torch.random.fork_rng(
-            devices=rng_devices, enabled=preserve_rng_state, device_type=device
-        ):
-            if preserve_rng_state:
-                torch.set_rng_state(fwd_cpu_state)
-                if had_device_in_fwd:
-                    set_device_states(fwd_devices, fwd_device_states, device_type=device)
+    
+        device_autocast_ctx = torch.amp.autocast(
+            device_type=device, **device_autocast_kwargs
+        ) if torch.amp.is_autocast_available(device) else contextlib.nullcontext()
+        with device_autocast_ctx, torch.amp.autocast(device_type="cpu",**cpu_autocast_kwargs), \
+                recompute_context:
+            if NOPIPELINE:
+                idx = [i for i in range(len(matepoint_ctx)) if matepoint_ctx[i][2] == ogextra]
+                assert len(idx) == 1
+                idx = idx[0]
+                # print("fetched", idx)
+                args, devices, checksum = matepoint_ctx.pop(idx)
+            else:
+                args, devices, checksum = matepoint_ctx.pop()
 
-            device_autocast_ctx = torch.amp.autocast(
-                device_type=device, **device_autocast_kwargs
-            ) if torch.amp.is_autocast_available(device) else contextlib.nullcontext()
-            with device_autocast_ctx, torch.amp.autocast(device_type="cpu",**cpu_autocast_kwargs), \
-                 recompute_context:
-                if NOPIPELINE:
-                    idx = [i for i in range(len(matepoint_ctx)) if matepoint_ctx[i][2] == ogextra]
-                    assert len(idx) == 1
-                    idx = idx[0]
-                    # print("fetched", idx)
-                    args, devices, checksum = matepoint_ctx.pop(idx)
-                else:
-                    args, devices, checksum = matepoint_ctx.pop()
+            # This is where tensors are moved back to the GPU for computation in the backwards pass.
+            #
 
-                # This is where tensors are moved back to the GPU for computation in the backwards pass.
-                #
+            if 1:
+                newargs = []
+                for arg, d in zip(args, devices):
+                    if callable(arg):  # bigTable stuff, fix indexing
+                        arg = arg()[None]
+                    if d is not None:
+                        if arg.device != d:
+                            if PRINT:
+                                print(f"[=>] moving (p) {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {d} | check: {checksum}, og: {ogextra}")
+                            arg = arg.to(d)
+                    newargs.append(arg)
+                args = newargs
 
-                if 1:
-                    newargs = []
-                    for arg, d in zip(args, devices):
-                        if callable(arg):  # bigTable stuff, fix indexing
-                            arg = arg()[None]
-                        if d is not None:
-                            if arg.device != d:
-                                if PRINT:
-                                    print(f"[=>] moving (p) {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {d} | check: {checksum}, og: {ogextra}")
-                                arg = arg.to(d)
-                        newargs.append(arg)
-                    args = newargs
+            else:  # keeping the old list comprehension for reference
+                args = [(arg.to(d) if arg.device != d else arg) if d is not None else arg for arg, d in zip(args, devices)]
 
-                else:  # keeping the old list comprehension for reference
-                    args = [(arg.to(d) if arg.device != d else arg) if d is not None else arg for arg, d in zip(args, devices)]
+            assert checksum == ogextra, f"matepoint checksum mismatch: {checksum} vs {ogextra}"
+            if not NOPIPELINE:
+                with torch.cuda.stream(stream):
+                    torch.cuda.synchronize()
+                    if matepoint_ctx is not None:
 
-                assert checksum == ogextra, f"matepoint checksum mismatch: {checksum} vs {ogextra}"
-                if not NOPIPELINE:
-                    with torch.cuda.stream(stream):
-                        torch.cuda.synchronize()
-                        if matepoint_ctx is not None:
+                        # Most tensors should be moved in the pipelined move
+                        matepoint_pipeline(matepoint_ctx, stream)
 
-                            # Most tensors should be moved in the pipelined move
-                            matepoint_pipeline(matepoint_ctx, stream)
-
-                fn(*[x for x, d in zip(args, devices)], **kwargs)
+            fn(*[x for x, d in zip(args, devices)], **kwargs)
 
     new_frame = _CheckpointFrame(
         recompute_fn,
@@ -1427,19 +1222,10 @@ def _checkpoint_without_reentrant_generator(
 
     with _checkpoint_hook(new_frame), forward_context:
         yield
-    for arg in args:
-        if isinstance(arg, torch.Tensor):
-            check_inplace_modifications(arg)
+    if check_inplace_modifications_flag:
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                check_inplace_modifications(arg)
     new_frame.forward_completed = True
-
-    if getattr(device_module, "_initialized", False) and \
-       preserve_rng_state and not had_device_in_fwd:  # type: ignore[possibly-undefined]
-        # Device was not initialized before running the forward, so we didn't
-        # stash the device state.
-        raise RuntimeError(
-            "PyTorch's device state was initialized in the forward pass "
-            "of a Checkpoint, which is not allowed. Please open an issue "
-            "if you need this feature."
-        )
 
     return
