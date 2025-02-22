@@ -27,6 +27,7 @@ from torch.testing._internal.logging_tensor import capture_logs, LoggingTensorMo
 __all__ = [
     "checkpoint",
     "checkpoint_sequential",
+    "matepoint_pipeline",
     "CheckpointError",
     "check_backward_validity",
     "detach_variable",

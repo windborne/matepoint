@@ -8,4 +8,5 @@ __all__ = [
     'checkpoint',
     'checkpoint_sequential',
     'Gmatepoint_ctx',
+    'matepoint_pipeline'
 ]
