@@ -358,7 +358,8 @@ def checkpoint(
             )
 
         gen = _checkpoint_without_reentrant_generator(
-            function, stream, matepoint_ctx, context_fn, determinism_check, debug, *args, check_inplace_modifications_flag=check_inplace_modifications_flag, **kwargs
+            #function, stream, matepoint_ctx, context_fn, determinism_check, debug, *args, check_inplace_modifications_flag, **kwargs
+            function, stream, matepoint_ctx, context_fn, determinism_check, debug, check_inplace_modifications_flag, *args, **kwargs
         )
         # Runs pre-forward logic
         next(gen)
