@@ -40,8 +40,11 @@ pip install --index-url https://test.pypi.org/simple/ matepoint
 
 ## Build
 ```bash
+rm -rf dist/ build/ .egg-info
 python setup.py sdist bdist_wheel
 twine upload --repository testpypi dist/*
+# if needed, can specify exact version
+# twine upload --repository testpypi dist/matepoint-0.1.7* 
 ```
 
 ## References
