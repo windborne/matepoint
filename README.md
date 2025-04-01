@@ -50,3 +50,27 @@ Refer to the Matepoint section in this [blog post](https://windbornesystems.com/
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Real-World Example
+
+We actually built Matepoint when we were running out of VRAM trying to solve weather(™) with transformers. While WeatherMesh, our model itself isn't huge (~180M parameters), forecasting weather for the entire planet over 6 days means running through 200+ transformer layers.
+
+Without some clever tricks, we'd need hundreds of GiB of VRAM. Even regular checkpointing wasn't enough - storing those 200MiB latent tensors for each transformer block would eat up around 40GiB of VRAM, which is more than even an RTX 4090 can handle.
+
+Matepoint ships those tensors off to CPU RAM when we don't need them, then brings them back just in time during the backward pass. Adding more forecast days costs almost nothing in VRAM terms. This meant we could train our whole weather model on consumer RTX 4090s instead of shelling out for pricier hardware.
+
+Check out these visualizations to see Matepoint in action:
+
+![Matepoint forward pass](images/Matepoint_fw.svg)
+![Matepoint backward pass](images/Matepoint_bw.svg)
+
+## Advanced Options
+
+### Pipeline Mode
+
+Matepoint overlaps data movement with computation by default, improving performance by efficiently transferring tensors between CPU and GPU. You can disable this optimization if needed:
+
+```python
+import matepoint
+matepoint.NOPIPELINE = True  # Disable pipelined tensor transfers
+```
