@@ -28,8 +28,8 @@ class InPlaceModel(torch.nn.Module):
         output = torch.sin(x)        
         return output
 
-def test_model(checkpoint_type="none", compile=False, inplace=False):
-    print(f"\nTesting with checkpoint type: {checkpoint_type}, compile: {compile}, inplace: {inplace}")
+def test_model(checkpoint_type="none", compile=False, inplace=False, pipeline=True):
+    print(f"\nTesting with checkpoint type: {checkpoint_type}, compile: {compile}, inplace: {inplace}, pipeline: {pipeline}")
     
     if inplace:
         model = InPlaceModel().cuda()
@@ -47,7 +47,7 @@ def test_model(checkpoint_type="none", compile=False, inplace=False):
     if checkpoint_type == "none":
         output = model(input)
     elif checkpoint_type == "matepoint":
-        output = matepoint.checkpoint(create_func, input, use_reentrant=False)
+        output = matepoint.checkpoint(create_func, input, use_reentrant=False, pipeline=pipeline)
     elif checkpoint_type == "torch":
         output = checkpoint(create_func, input, use_reentrant=False)
     else:
@@ -99,4 +99,6 @@ if __name__ == "__main__":
     # test_model(checkpoint_type="matepoint", compile=True)
     # take command line arg for checkpoint type
     test_model(checkpoint_type='matepoint', inplace=True)
+    # Test with pipeline disabled
+    test_model(checkpoint_type='matepoint', inplace=True, pipeline=False)
     #test_nested_matepoint()
