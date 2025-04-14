@@ -71,9 +71,17 @@ Check out these visualizations to see Matepoint in action:
 
 ### Pipeline Mode
 
-Matepoint overlaps data movement with computation by default, improving performance by efficiently transferring tensors between CPU and GPU. You can disable this optimization if needed:
+Matepoint overlaps data movement with computation by default, improving performance by efficiently transferring tensors between CPU and GPU. You can control this behavior using the `pipeline` parameter (default is `True`):
 
 ```python
+# Disable pipelining directly in the checkpoint call
+from matepoint import checkpoint
+output = checkpoint(function, input, pipeline=False)
+```
+
+For older versions, you would use the global variable (now deprecated):
+```python
+# Deprecated approach (older versions only)
 import matepoint
 matepoint.NOPIPELINE = True  # Disable pipelined tensor transfers
 ```

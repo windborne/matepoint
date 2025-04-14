@@ -224,6 +224,7 @@ def checkpoint(
     context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
     determinism_check: str = _DEFAULT_DETERMINISM_MODE,
     debug: bool = False,
+    pipeline: bool = True,
     **kwargs
 ):
     r"""Checkpoint a model or part of the model.
@@ -358,8 +359,7 @@ def checkpoint(
             )
 
         gen = _checkpoint_without_reentrant_generator(
-            #function, stream, matepoint_ctx, context_fn, determinism_check, debug, *args, check_inplace_modifications_flag, **kwargs
-            function, stream, matepoint_ctx, context_fn, determinism_check, debug, check_inplace_modifications_flag, *args, **kwargs
+            function, stream, matepoint_ctx, context_fn, determinism_check, debug, check_inplace_modifications_flag, pipeline, *args, **kwargs
         )
         # Runs pre-forward logic
         next(gen)
@@ -1013,8 +1013,11 @@ class _checkpoint_hook(torch.autograd.graph.saved_tensors_hooks):
 # NB: this helper wraps fn before calling checkpoint_impl. kwargs and
 #     saving/restoring of global state is handled here.
 
+# Check for environment variable to control printing
 PRINT = False
-# PRINT = int(os.environ.get('RANK', 0)) == 0
+import os
+if os.environ.get('MATEPOINT_PRINTS', '') == '1':
+    PRINT = True
 
 def size_mb(t):
     return t.numel() * t.element_size() / 1024 / 1024
@@ -1049,9 +1052,6 @@ def elist(xx):
 bigTable = None
 bigN = 0
 
-NOPIPELINE = True
-NOPIPELINE = False
-
 def check_inplace_modifications(tensor):
     """Check if a tensor has been modified in-place by comparing its version counter."""
     if hasattr(tensor, "_version"):
@@ -1071,6 +1071,7 @@ def _checkpoint_without_reentrant_generator(
     determinism_check: str = _DEFAULT_DETERMINISM_MODE,
     debug: bool = False,
     check_inplace_modifications_flag: bool = False,
+    pipeline: bool = True,
     *args,
     **kwargs
 ):
@@ -1136,7 +1137,7 @@ def _checkpoint_without_reentrant_generator(
         ) if torch.amp.is_autocast_available(device) else contextlib.nullcontext()
         with device_autocast_ctx, torch.amp.autocast(device_type="cpu",**cpu_autocast_kwargs), \
                 recompute_context:
-            if NOPIPELINE:
+            if not pipeline:
                 idx = [i for i in range(len(matepoint_ctx)) if matepoint_ctx[i][2] == ogextra]
                 assert len(idx) == 1
                 idx = idx[0]
@@ -1165,7 +1166,7 @@ def _checkpoint_without_reentrant_generator(
                 args = [(arg.to(d) if arg.device != d else arg) if d is not None else arg for arg, d in zip(args, devices)]
 
             assert checksum == ogextra, f"matepoint checksum mismatch: {checksum} vs {ogextra}"
-            if not NOPIPELINE:
+            if pipeline:
                 with torch.cuda.stream(stream):
                     torch.cuda.synchronize()
                     if matepoint_ctx is not None:
