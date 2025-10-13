@@ -1049,9 +1049,6 @@ def elist(xx):
         out.append(x.flatten()[0].item())
     return out
 
-bigTable = None
-bigN = 0
-
 def check_inplace_modifications(tensor):
     """Check if a tensor has been modified in-place by comparing its version counter."""
     if hasattr(tensor, "_version"):
@@ -1099,7 +1096,7 @@ def _checkpoint_without_reentrant_generator(
         *args: Arguments to pass in to the given ``function``.
         **kwargs: Keyword arguments to pass into the given ``function``.
     """
-    global bigN, bigTable
+    
 
     # global all_contexts
 
@@ -1152,8 +1149,6 @@ def _checkpoint_without_reentrant_generator(
             if 1:
                 newargs = []
                 for arg, d in zip(args, devices):
-                    if callable(arg) and getattr(arg, "_matepoint_bigtable", False):  # bigTable stuff, fix indexing
-                        arg = arg()[None]
                     if d is not None:
                         if arg.device != d:
                             if PRINT:
@@ -1199,17 +1194,7 @@ def _checkpoint_without_reentrant_generator(
                 if PRINT:
                     print(f"[<=] moving {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {cpu} | og: {ogextra}")
                     # print(MemoryMonitor().str())
-                if bigTable is not None and arg[0].shape[-1] == bigTable[0].shape[-1]:
-                    bigTable[bigN].copy_(arg[0], non_blocking=True)
-                    def oops(capt):
-                        def fn():
-                            return bigTable[capt]
-                        fn._matepoint_bigtable = True
-                        return fn
-                    xcpu = oops(bigN)
-                    bigN += 1
-                else:
-                    xcpu = arg.to(cpu, non_blocking=True)
+                xcpu = arg.to(cpu, non_blocking=True)
             else:
                 xcpu = arg
             args_cpu.append(xcpu)
