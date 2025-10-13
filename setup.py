@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="matepoint",
-    version="0.1.8",
+    version="0.1.9",
     packages=find_packages(),
     install_requires=["torch>=2.4.0"],
     author="Windborne Systems",

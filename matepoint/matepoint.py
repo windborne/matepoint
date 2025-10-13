@@ -1152,7 +1152,7 @@ def _checkpoint_without_reentrant_generator(
             if 1:
                 newargs = []
                 for arg, d in zip(args, devices):
-                    if callable(arg):  # bigTable stuff, fix indexing
+                    if callable(arg) and getattr(arg, "_matepoint_bigtable", False):  # bigTable stuff, fix indexing
                         arg = arg()[None]
                     if d is not None:
                         if arg.device != d:
@@ -1204,6 +1204,7 @@ def _checkpoint_without_reentrant_generator(
                     def oops(capt):
                         def fn():
                             return bigTable[capt]
+                        fn._matepoint_bigtable = True
                         return fn
                     xcpu = oops(bigN)
                     bigN += 1
