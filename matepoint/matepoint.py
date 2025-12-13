@@ -1029,11 +1029,14 @@ def matepoint_pipeline(ctx, stream):
             if 1:
                 ctx_extra = []
                 check = ctx[-1][-1]
-                for x, d, _ in zip(*ctx[-1]):
+                for x, d, dt, _ in zip(*ctx[-1]):
                     if hasattr(x, "device"):
                         if PRINT:
                             print(f"[=>] moving (p) {[xx for xx in x.shape]} {size_mb(x):.2f} MiB from {x.device} to {d} | check: {check}")
-                        ctx_extra.append(x.to(d, non_blocking=True))
+                        if dt is not None and  x.dtype != dt:
+                            ctx_extra.append(x.to(dt, non_blocking=True).to(d, non_blocking=True))
+                        else:
+                            ctx_extra.append(x.to(d, non_blocking=True))
                     else:
                         ctx_extra.append(x)
                 ctx[-1][0] = ctx_extra
@@ -1059,6 +1062,17 @@ def check_inplace_modifications(tensor):
                 f"[{tensor.type()} {list(tensor.shape)}], which is at version {current_version}; "
                 f"expected version 0 instead. In-place modifications are not supported with matepoint."
             )
+
+def _select_target_type(x: torch.Tensor) -> torch.dtype:
+    # TODO: ``nocompess`` setting, and when true return always the same dtype.
+    match (x.dtype):
+        case torch.float32:
+            return torch.float16
+        case torch.float16:
+            return torch.float8_e4m3fnuz
+        case _:
+            return x.dtype
+
 
 def _checkpoint_without_reentrant_generator(
     fn,
@@ -1135,25 +1149,28 @@ def _checkpoint_without_reentrant_generator(
         with device_autocast_ctx, torch.amp.autocast(device_type="cpu",**cpu_autocast_kwargs), \
                 recompute_context:
             if not pipeline:
-                idx = [i for i in range(len(matepoint_ctx)) if matepoint_ctx[i][2] == ogextra]
+                idx = [i for i in range(len(matepoint_ctx)) if matepoint_ctx[i][3] == ogextra]
                 assert len(idx) == 1
                 idx = idx[0]
                 # print("fetched", idx)
-                args, devices, checksum = matepoint_ctx.pop(idx)
+                args, devices, dtypes, checksum = matepoint_ctx.pop(idx)
             else:
-                args, devices, checksum = matepoint_ctx.pop()
+                args, devices, dtypes, checksum = matepoint_ctx.pop()
 
             # This is where tensors are moved back to the GPU for computation in the backwards pass.
             #
 
             if 1:
                 newargs = []
-                for arg, d in zip(args, devices):
+                for arg, d, dt in zip(args, devices, dtypes):
                     if d is not None:
                         if arg.device != d:
                             if PRINT:
                                 print(f"[=>] moving (p) {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {d} | check: {checksum}, og: {ogextra}")
-                            arg = arg.to(d)
+                            if dt is not None and arg.dtype != dt:
+                                arg = arg.to(d).to(dt)
+                            else:
+                                arg = arg.to(d)
                     newargs.append(arg)
                 args = newargs
 
@@ -1180,12 +1197,17 @@ def _checkpoint_without_reentrant_generator(
     dummy = torch.empty((0,), requires_grad=True)
     cpu = torch.device("cpu")
     # kwargs["devices"] = [x.device if hasattr(x, "device") else None for x in args]
-    args_cpu, devices = [], []
+    args_cpu = []
+    devices = []
+    dtypes = []
     with torch.cuda.stream(stream):
 
         for arg in args:
             device_ = arg.device if hasattr(arg, "device") else None
+            dtype_ = arg.dtype if hasattr(arg, "dtype") else None
+            target_dtype = _select_target_type(arg) if dtype_ is not None else None
             devices.append(device_)
+            dtypes += [dtype_ if target_dtype != dtype_ else None]
             torch.cuda.synchronize()
 
             # This part is called during the forwards pass, and is when tensors are sent back to the CPU
@@ -1194,13 +1216,16 @@ def _checkpoint_without_reentrant_generator(
                 if PRINT:
                     print(f"[<=] moving {[aa for aa in arg.shape]} {size_mb(arg):.2f} MiB from {arg.device} to {cpu} | og: {ogextra}")
                     # print(MemoryMonitor().str())
-                xcpu = arg.to(cpu, non_blocking=True)
+                if target_dtype is not None and target_dtype != dtype_:
+                    xcpu = arg.to(cpu, non_blocking=True).to(target_dtype, non_blocking=True)
+                else:
+                    xcpu = arg.to(cpu, non_blocking=True)
             else:
                 xcpu = arg
             args_cpu.append(xcpu)
 
     new_frame.input_saver = _NoopSaveInputs.apply(dummy, kwargs, len(matepoint_ctx))
-    matepoint_ctx.append([args_cpu, devices, ogextra])
+    matepoint_ctx.append([args_cpu, devices, dtypes, ogextra])
     del xcpu
     del args_cpu
 
