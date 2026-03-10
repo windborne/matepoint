@@ -98,6 +98,8 @@ We benchmarked matepoint on [Karpathy's nanochat](https://github.com/karpathy/na
 
 At the same batch size, matepoint reduces VRAM by 34–40% with ~28% step time overhead, while using only ~1–2 GB of extra CPU RAM for offloaded activations. This enables 2x the batch size on the same GPU.
 
+> **Note on throughput overhead:** The ~28% overhead is inflated here because nanochat's small models have very short step times (~200–300 ms), leaving little computation to hide PCIe transfers behind. With larger models where step times are in seconds, the async pipelining fully overlaps transfers with compute and overhead drops to near-zero. ~15% of the overhead is also from gradient recomputation (inherent to checkpointing, not matepoint-specific).
+
 See [`examples/nanochat/`](examples/nanochat/) for the benchmark script and setup instructions.
 
 ## Advanced Options

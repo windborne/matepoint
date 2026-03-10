@@ -28,6 +28,8 @@ nanochat is widely used by the LLM community to train GPT-2 class models. It kee
 
 **At same batch size:** 34–40% VRAM reduction with ~28% step time overhead and only ~1–2 GB extra CPU RAM. Matepoint pipelines CPU↔GPU transfers with computation to minimize the throughput cost.
 
+> **Note on throughput overhead:** The ~28% overhead is inflated here because nanochat's small models have very short step times (~200–300 ms), leaving little computation to hide PCIe transfers behind. With larger models where step times are in seconds, the async pipelining fully overlaps transfers with compute and overhead drops to near-zero. ~15% of the overhead is also from gradient recomputation (inherent to checkpointing, not matepoint-specific).
+
 ## How it works
 
 The integration is a single function that wraps each transformer block with `matepoint.checkpoint`:
