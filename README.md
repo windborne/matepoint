@@ -10,6 +10,20 @@ Matepoint is a fork of PyTorch's `torch.utils.checkpoint` that allows you to uti
 3. Supporting pipelined tensor transfers for better performance
 4. Providing optional CPU memory pooling for large, similarly-shaped tensors
 
+
+## How Matepoint Compares
+
+PyTorch offers several ways to reduce activation memory. Here's where matepoint fits:
+
+| Approach | Mechanism | Async pipelining | Drop-in? |
+|---|---|---|---|
+| `torch.utils.checkpoint` | Recompute activations (no CPU offload) | N/A | Yes |
+| `torch.autograd.graph.save_on_cpu` | Offload all saved tensors to CPU | No — GPU stalls on backward | Yes |
+| torchtune `OffloadActivations` | Offload via saved_tensors_hooks + CUDA stream | Yes | Yes |
+| **Matepoint** | Extends checkpoint with CPU offload + CUDA stream pipelining | **Yes** | Yes |
+
+The key difference: `save_on_cpu` is synchronous (reported ~6x slowdown), while matepoint and torchtune both use a dedicated CUDA stream to overlap CPU↔GPU transfers with computation. Matepoint integrates this directly into the checkpoint API — recomputation + offloading + pipelining in one `checkpoint()` call.
+
 ## Usage
 
 Replace your existing `torch.utils.checkpoint` calls with `matepoint`:
@@ -66,6 +80,27 @@ Check out these visualizations to see Matepoint in action:
 
 ![Matepoint forward pass](images/Matepoint_fw.svg)
 ![Matepoint backward pass](images/Matepoint_bw.svg)
+
+## LLM Example: nanochat
+
+We benchmarked matepoint on [Karpathy's nanochat](https://github.com/karpathy/nanochat) GPT models on an RTX 4090 (24 GB VRAM, 504 GB RAM):
+
+| Model | Batch | Mode | Peak VRAM | Step Time | Throughput | CPU RAM |
+|---|---|---|---|---|---|---|
+| d12 (286M) | 8 | Baseline | 16.04 GB | 202 ms | 81k tok/s | +0.4 GB |
+| d12 (286M) | 8 | Matepoint | **10.63 GB** | 258 ms | 64k tok/s | +0.9 GB |
+| d12 (286M) | 16 | Baseline | OOM | — | — | — |
+| d12 (286M) | 16 | Matepoint | **18.99 GB** | 513 ms | 64k tok/s | +1.5 GB |
+| d20 (897M) | 4 | Baseline | 20.03 GB | 295 ms | 28k tok/s | +0.4 GB |
+| d20 (897M) | 4 | Matepoint | **12.04 GB** | 383 ms | 21k tok/s | +1.3 GB |
+| d20 (897M) | 8 | Baseline | OOM | — | — | — |
+| d20 (897M) | 8 | Matepoint | **16.48 GB** | 746 ms | 22k tok/s | +2.3 GB |
+
+At the same batch size, matepoint reduces VRAM by 34–40% with ~28% step time overhead, while using only ~1–2 GB of extra CPU RAM for offloaded activations. This enables 2x the batch size on the same GPU.
+
+> **Note on throughput overhead:** The ~28% overhead is inflated here because nanochat's small models have very short step times (~200–300 ms), leaving little computation to hide PCIe transfers behind. With larger models where step times are in seconds, the async pipelining fully overlaps transfers with compute and overhead drops to near-zero. ~15% of the overhead is also from gradient recomputation (inherent to checkpointing, not matepoint-specific).
+
+See [`examples/nanochat/`](examples/nanochat/) for the benchmark script and setup instructions.
 
 ## Advanced Options
 
