@@ -29,16 +29,16 @@ Usage (run from nanochat repo root):
 RTX 4090 (24 GB) results:
 
     d12 (286M params):
-    | Batch | Baseline VRAM | Matepoint VRAM | Throughput overhead |
-    |-------|---------------|----------------|---------------------|
-    | 8     | 16.04 GB      | 10.63 GB (-34%)| 22%                 |
-    | 16    | OOM           | 18.99 GB       | -                   |
+    | Batch | Baseline VRAM | Matepoint VRAM | Step Time (ms) | CPU RAM delta |
+    |-------|---------------|----------------|-----------------|---------------|
+    | 8     | 16.04 GB      | 10.63 GB (-34%)| 202 -> 258 (+28%)| +0.6 GB      |
+    | 16    | OOM           | 18.99 GB       | N/A -> 513      | +1.1 GB      |
 
     d20 (897M params):
-    | Batch | Baseline VRAM | Matepoint VRAM | Throughput overhead |
-    |-------|---------------|----------------|---------------------|
-    | 4     | 20.03 GB      | 12.04 GB (-40%)| 23%                 |
-    | 8     | OOM           | 16.48 GB       | -                   |
+    | Batch | Baseline VRAM | Matepoint VRAM | Step Time (ms) | CPU RAM delta |
+    |-------|---------------|----------------|-----------------|---------------|
+    | 4     | 20.03 GB      | 12.04 GB (-40%)| 295 -> 384 (+30%)| +1.0 GB     |
+    | 8     | OOM           | 16.48 GB       | N/A -> 745      | +2.0 GB      |
 """
 
 import os
@@ -51,8 +51,14 @@ import json
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.nn.functional as F
+import psutil
 
 import matepoint
+
+
+def get_cpu_ram_gb():
+    """Get current process RSS in GB."""
+    return psutil.Process().memory_info().rss / (1024**3)
 
 
 def build_model(depth, vocab_size, seq_len, device):
@@ -133,6 +139,8 @@ def run_benchmark(depth, batch_size, seq_len, num_steps, use_matepoint, device_i
 
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
+
+    ram_before_model = get_cpu_ram_gb()
     model = build_model(depth, vocab_size, seq_len, device)
     num_params = sum(p.numel() for p in model.parameters())
     mode_str = "matepoint" if use_matepoint else "baseline"
@@ -150,7 +158,10 @@ def run_benchmark(depth, batch_size, seq_len, num_steps, use_matepoint, device_i
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
+    ram_before_train = get_cpu_ram_gb()
+    peak_ram = ram_before_train
     step_times = []
+
     try:
         for step in range(num_steps):
             x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
@@ -164,29 +175,35 @@ def run_benchmark(depth, batch_size, seq_len, num_steps, use_matepoint, device_i
             torch.cuda.synchronize()
             dt = time.time() - t0
 
+            current_ram = get_cpu_ram_gb()
+            peak_ram = max(peak_ram, current_ram)
+
             if step >= 2:
                 step_times.append(dt)
 
-            peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+            peak_vram = torch.cuda.max_memory_allocated(device) / (1024**3)
             tps = batch_size * seq_len / dt
             if step < 3 or step % 5 == 0:
                 print(f"  step {step:3d} | loss {loss.item():.4f} | {dt*1000:.0f}ms | "
-                      f"{tps:,.0f} tok/s | peak {peak_gb:.2f} GB")
+                      f"{tps:,.0f} tok/s | vram {peak_vram:.2f} GB | ram {current_ram:.2f} GB")
 
-        peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+        peak_vram = torch.cuda.max_memory_allocated(device) / (1024**3)
         avg_dt = sum(step_times) / len(step_times) if step_times else 0
         avg_tps = batch_size * seq_len / avg_dt if avg_dt > 0 else 0
+        ram_delta = peak_ram - ram_before_train
 
-        print(f"\n  Peak VRAM: {peak_gb:.2f} GB | Avg: {avg_dt*1000:.0f}ms/step, {avg_tps:,.0f} tok/s")
+        print(f"\n  Peak VRAM: {peak_vram:.2f} GB | Step: {avg_dt*1000:.0f}ms | "
+              f"{avg_tps:,.0f} tok/s | CPU RAM delta: +{ram_delta:.2f} GB")
         return dict(mode=mode_str, depth=depth, batch_size=batch_size, params=num_params,
-                    peak_vram_gb=round(peak_gb, 2), avg_step_ms=round(avg_dt*1000, 1),
-                    avg_tok_per_s=round(avg_tps), status="ok")
+                    peak_vram_gb=round(peak_vram, 2), avg_step_ms=round(avg_dt*1000, 1),
+                    avg_tok_per_s=round(avg_tps), cpu_ram_delta_gb=round(ram_delta, 2),
+                    status="ok")
 
     except torch.cuda.OutOfMemoryError:
-        peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
-        print(f"\n  OOM at step {step}! (peak was {peak_gb:.2f} GB)")
+        peak_vram = torch.cuda.max_memory_allocated(device) / (1024**3)
+        print(f"\n  OOM at step {step}! (peak vram was {peak_vram:.2f} GB)")
         return dict(mode=mode_str, depth=depth, batch_size=batch_size, params=num_params,
-                    peak_vram_gb=round(peak_gb, 2), status="OOM")
+                    peak_vram_gb=round(peak_vram, 2), status="OOM")
 
 
 def run_sweep(depth, seq_len, num_steps, device_id):
@@ -203,7 +220,6 @@ def run_sweep(depth, seq_len, num_steps, device_id):
                    f"--steps={num_steps}", f"--gpu={device_id}", f"--mode={mode}",
                    "--json"]
             proc = subprocess.run(cmd, capture_output=True, text=True)
-            # Parse JSON from last line
             for line in reversed(proc.stdout.strip().split('\n')):
                 try:
                     r = json.loads(line)
@@ -217,18 +233,20 @@ def run_sweep(depth, seq_len, num_steps, device_id):
                 results.append(dict(mode=mode, depth=depth, batch_size=bs, status="error"))
 
             if results[-1].get("status") == "OOM":
-                break  # stop this mode at first OOM
+                break
 
     # Print summary table
-    print(f"\n{'='*70}")
+    print(f"\n{'='*75}")
     print(f"  SWEEP RESULTS — d{depth} on {torch.cuda.get_device_name(0)}")
-    print(f"{'='*70}")
-    print(f"  {'Mode':<12} {'Batch':<7} {'Peak VRAM':<12} {'Throughput':<15} {'Status'}")
-    print(f"  {'-'*12} {'-'*7} {'-'*12} {'-'*15} {'-'*7}")
+    print(f"{'='*75}")
+    print(f"  {'Mode':<12} {'Batch':<7} {'Peak VRAM':<12} {'Step (ms)':<11} {'Throughput':<15} {'RAM delta':<10} {'Status'}")
+    print(f"  {'-'*12} {'-'*7} {'-'*12} {'-'*11} {'-'*15} {'-'*10} {'-'*7}")
     for r in results:
         vram = f"{r.get('peak_vram_gb', '?')} GB" if r['status'] != 'error' else '?'
+        step = f"{r.get('avg_step_ms', '-')}" if r['status'] == 'ok' else '-'
         tps = f"{r.get('avg_tok_per_s', 0):,} tok/s" if r['status'] == 'ok' else r['status']
-        print(f"  {r['mode']:<12} {r['batch_size']:<7} {vram:<12} {tps:<15} {r['status']}")
+        ram = f"+{r.get('cpu_ram_delta_gb', '?')} GB" if r['status'] == 'ok' else '-'
+        print(f"  {r['mode']:<12} {r['batch_size']:<7} {vram:<12} {step:<11} {tps:<15} {ram:<10} {r['status']}")
 
     return results
 
@@ -250,9 +268,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.mode == "both":
-        # Run each in a subprocess for clean GPU state
         import subprocess
-        all_results = []
         for mode in ["baseline", "matepoint"]:
             cmd = [sys.executable, __file__,
                    f"--depth={args.depth}", f"--batch-size={args.batch_size}",

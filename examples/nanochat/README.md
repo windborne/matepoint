@@ -10,19 +10,23 @@ nanochat is widely used by the LLM community to train GPT-2 class models. It kee
 
 ### d12 — 286M params
 
-| Batch Size | Baseline | Matepoint | VRAM Saved |
-|---|---|---|---|
-| 8 | 16.04 GB @ 81k tok/s | 10.63 GB @ 64k tok/s | 5.4 GB (34%) |
-| 16 | OOM | 18.99 GB @ 64k tok/s | **enables 2x batch** |
+| Batch | Mode | Peak VRAM | Step Time | Throughput | CPU RAM delta |
+|---|---|---|---|---|---|
+| 8 | Baseline | 16.04 GB | 202 ms | 81k tok/s | +0.4 GB |
+| 8 | Matepoint | **10.63 GB** | 258 ms | 64k tok/s | +0.9 GB |
+| 16 | Baseline | OOM | — | — | — |
+| 16 | Matepoint | **18.99 GB** | 513 ms | 64k tok/s | +1.5 GB |
 
 ### d20 — 897M params
 
-| Batch Size | Baseline | Matepoint | VRAM Saved |
-|---|---|---|---|
-| 4 | 20.03 GB @ 28k tok/s | 12.04 GB @ 21k tok/s | 8.0 GB (40%) |
-| 8 | OOM | 16.48 GB @ 22k tok/s | **enables 2x batch** |
+| Batch | Mode | Peak VRAM | Step Time | Throughput | CPU RAM delta |
+|---|---|---|---|---|---|
+| 4 | Baseline | 20.03 GB | 295 ms | 28k tok/s | +0.4 GB |
+| 4 | Matepoint | **12.04 GB** | 383 ms | 21k tok/s | +1.3 GB |
+| 8 | Baseline | OOM | — | — | — |
+| 8 | Matepoint | **16.48 GB** | 746 ms | 22k tok/s | +2.3 GB |
 
-**Throughput overhead:** ~22% from checkpoint recomputation + CPU↔GPU transfer. Matepoint pipelines these transfers with computation to minimize the cost.
+**At same batch size:** 34–40% VRAM reduction with ~28% step time overhead and only ~1–2 GB extra CPU RAM. Matepoint pipelines CPU↔GPU transfers with computation to minimize the throughput cost.
 
 ## How it works
 
