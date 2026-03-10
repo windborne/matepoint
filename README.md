@@ -10,6 +10,20 @@ Matepoint is a fork of PyTorch's `torch.utils.checkpoint` that allows you to uti
 3. Supporting pipelined tensor transfers for better performance
 4. Providing optional CPU memory pooling for large, similarly-shaped tensors
 
+
+## How Matepoint Compares
+
+PyTorch offers several ways to reduce activation memory. Here's where matepoint fits:
+
+| Approach | Mechanism | Async pipelining | Drop-in? |
+|---|---|---|---|
+| `torch.utils.checkpoint` | Recompute activations (no CPU offload) | N/A | Yes |
+| `torch.autograd.graph.save_on_cpu` | Offload all saved tensors to CPU | No — GPU stalls on backward | Yes |
+| torchtune `OffloadActivations` | Offload via saved_tensors_hooks + CUDA stream | Yes | Yes |
+| **Matepoint** | Extends checkpoint with CPU offload + CUDA stream pipelining | **Yes** | Yes |
+
+The key difference: `save_on_cpu` is synchronous (reported ~6x slowdown), while matepoint and torchtune both use a dedicated CUDA stream to overlap CPU↔GPU transfers with computation. Matepoint integrates this directly into the checkpoint API — recomputation + offloading + pipelining in one `checkpoint()` call.
+
 ## Usage
 
 Replace your existing `torch.utils.checkpoint` calls with `matepoint`:
@@ -66,6 +80,21 @@ Check out these visualizations to see Matepoint in action:
 
 ![Matepoint forward pass](images/Matepoint_fw.svg)
 ![Matepoint backward pass](images/Matepoint_bw.svg)
+
+## LLM Example: nanochat
+
+We benchmarked matepoint on [Karpathy's nanochat](https://github.com/karpathy/nanochat) GPT models on an RTX 4090 (24 GB):
+
+| Model | Batch | Baseline VRAM | Matepoint VRAM | Savings |
+|---|---|---|---|---|
+| d12 (286M) | 8 | 16.04 GB | 10.63 GB | 34% less VRAM |
+| d12 (286M) | 16 | OOM | 18.99 GB | **enables 2x batch** |
+| d20 (897M) | 4 | 20.03 GB | 12.04 GB | 40% less VRAM |
+| d20 (897M) | 8 | OOM | 16.48 GB | **enables 2x batch** |
+
+Throughput overhead is ~22% (recomputation + PCIe transfer, pipelined).
+
+See [`examples/nanochat/`](examples/nanochat/) for the benchmark script and setup instructions.
 
 ## Advanced Options
 
